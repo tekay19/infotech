@@ -1,0 +1,765 @@
+import numpy as np
+import random
+from collections import deque
+import time
+import logging
+import csv
+from decimal import Decimal, ROUND_DOWN
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+from typing import Optional, Tuple, Dict, Any, List
+
+# İlgili kütüphaneler: Binance, TensorFlow, Talib, OpenAI
+from binance.client import Client
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, LSTM, GRU, Bidirectional, BatchNormalization, Input
+from tensorflow.keras.optimizers import Adam
+import talib
+import openai
+
+# API anahtarlarınızı doğrudan kodda tutmaktan kaçının!
+OPEN_APİ
+# Loglama yapılandırması: Konsol ve dosya loglama
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler("trading_system.log", mode="a")]
+)
+
+# Konfigürasyon Parametreleri
+CONFIG = {
+    "portfolio_ratio": 1.0,       # Tüm fon spot işlem için kullanılacak
+    "short_window": 60,
+    "long_window": 1440,
+    "stop_loss": 0.03,
+    "take_profit": 0.05,
+    "base_risk_percentage": 0.05,
+    "max_daily_loss": 100.0,
+    "max_drawdown": 0.1,
+    "commission_rate": 0.001,     # %0.1 işlem komisyonu
+    "dqn": {
+        "gamma": 0.99,
+        "epsilon": 1.0,
+        "epsilon_min": 0.01,
+        "epsilon_decay": 0.995,
+        "learning_rate": 0.0005,
+        "tau": 0.1,
+        "memory_size": 10000
+    },
+    "price_predictor_window": 30,
+    "episode_steps": 1000,
+    "num_episodes": 1000,
+    "report_interval": 1000,
+    "sleep_interval": 0.5,
+    "min_trade_value": 20.0  # Artık kontrol kaldırıldı.
+}
+
+#####################################
+# Yardımcı Fonksiyonlar
+#####################################
+def round_step_size(quantity: float, step_size: float) -> float:
+    try:
+        quantity_dec = Decimal(str(quantity))
+        step_size_dec = Decimal(str(step_size))
+        rounded = (quantity_dec // step_size_dec) * step_size_dec
+        precision = -step_size_dec.as_tuple().exponent
+        result = float(rounded.quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN))
+        logging.debug(f"round_step_size: quantity={quantity}, step_size={step_size}, result={result}")
+        return result
+    except Exception as e:
+        logging.error(f"Yuvarlama sırasında hata: {e}")
+        return quantity
+
+def get_free_balance(client: Client, asset: str) -> float:
+    try:
+        if asset.upper() == "USDT":
+            try:
+                futures_balances = client.futures_account_balance()
+                for balance in futures_balances:
+                    if balance['asset'].upper() == asset.upper():
+                        free_balance = float(balance.get("balance", 0))
+                        logging.debug(f"{asset} futures bakiyesi: {free_balance}")
+                        return free_balance
+            except Exception as fe:
+                logging.error(f"Futures bakiyesi alınırken hata: {fe}")
+        balance_info = client.get_asset_balance(asset=asset)
+        balance = float(balance_info.get("free", 0))
+        logging.debug(f"{asset} spot bakiyesi: {balance}")
+        return balance
+    except Exception as e:
+        logging.error(f"{asset} bakiyesi alınırken hata: {e}")
+        return 0.0
+
+def chatgpt_response(prompt: str, model: str = "gpt-3.5-turbo", max_retries: int = 3) -> str:
+    """ChatGPT isteğini kota veya rate limit hatalarıyla karşılaşırsa yeniden denemek üzere güncellenmiş fonksiyon."""
+    retries = 0
+    while retries < max_retries:
+        try:
+            response = openai.ChatCompletion.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Sen, piyasayı titizlikle analiz eden, uzman bir kripto borsacısısın."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=150
+            )
+            answer = response.choices[0].message['content'].strip()
+            logging.debug(f"ChatGPT yanıtı: {answer}")
+            return answer
+        except openai.error.RateLimitError as e:
+            retries += 1
+            logging.error(f"RateLimitError ({retries}/{max_retries}): {e}. 10 saniye bekleniyor...")
+            time.sleep(10)
+        except openai.error.OpenAIError as e:
+            retries += 1
+            logging.error(f"OpenAIError ({retries}/{max_retries}): {e}. 10 saniye bekleniyor...")
+            time.sleep(10)
+        except Exception as e:
+            logging.error(f"ChatGPT isteği sırasında beklenmeyen hata: {e}")
+            break
+    return "Hata oluştu."
+
+def normalize_prices(prices: np.ndarray) -> np.ndarray:
+    if len(prices) == 0:
+        return prices
+    min_val, max_val = np.min(prices), np.max(prices)
+    normalized = (prices - min_val) / (max_val - min_val + 1e-8)
+    return normalized
+
+#####################################
+# PricePredictor (Fiyat Tahmin Modeli)
+#####################################
+class PricePredictor:
+    def __init__(self, window_size: int, model_path: Optional[str] = None):
+        self.window_size = window_size
+        self.model = self.build_model()
+        if model_path:
+            try:
+                self.model.load_weights(model_path)
+                logging.info("PricePredictor weights başarıyla yüklendi.")
+            except Exception as e:
+                logging.error(f"PricePredictor model yüklenirken hata: {e}")
+
+    def build_model(self) -> Sequential:
+        try:
+            model = Sequential([
+                Input(shape=(self.window_size, 1)),
+                Bidirectional(LSTM(128, return_sequences=True)),
+                Dropout(0.2),
+                Bidirectional(GRU(64, return_sequences=True)),
+                Dropout(0.2),
+                LSTM(64, return_sequences=False),
+                Dropout(0.2),
+                Dense(64, activation='relu'),
+                Dense(32, activation='relu'),
+                Dense(1)
+            ])
+            model.compile(loss='mse', optimizer=Adam(learning_rate=0.001))
+            logging.debug("PricePredictor modeli oluşturuldu.")
+            return model
+        except Exception as e:
+            logging.error(f"PricePredictor modeli oluşturulurken hata: {e}")
+            raise
+
+    def predict(self, prices: np.ndarray) -> float:
+        try:
+            norm_prices = normalize_prices(np.array(prices[-self.window_size:]))
+            if len(norm_prices) < self.window_size:
+                norm_prices = np.pad(norm_prices, (self.window_size - len(norm_prices), 0), 'constant')
+            inp = norm_prices.reshape(1, self.window_size, 1)
+            prediction = self.model.predict(inp, verbose=0)[0][0]
+            logging.debug(f"PricePredictor tahmini (normalized): {prediction}")
+            return prediction
+        except Exception as e:
+            logging.error(f"PricePredictor tahmin hatası: {e}")
+            return 0.0
+
+    def train(self, X: np.ndarray, y: np.ndarray, epochs: int = 10, batch_size: int = 64, verbose: int = 1):
+        try:
+            self.model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=verbose, validation_split=0.2)
+            logging.info("PricePredictor eğitimi tamamlandı.")
+        except Exception as e:
+            logging.error(f"PricePredictor eğitimi sırasında hata: {e}")
+
+#####################################
+# TradingEnv (Ticaret Ortamı)
+#####################################
+class TradingEnv:
+    """
+    Trading ortamı:
+      - Spot işlemler için portföyü ayırır.
+      - SMA, RSI, MACD, ADX, Bollinger Bands, OBV, StochRSI gibi teknik göstergeleri hesaplar.
+      - Durum vektörüne bu göstergeler, pozisyon bilgileri ve portföy bakiyeleri eklenir.
+      - İşlem geçmişi CSV'ye kaydedilir.
+      - Slippage ve komisyon etkileri hesaba katılır.
+      - Futures ve spot hesaplar arası transfer işlemi kaldırılmıştır.
+
+    Aksiyonlar:
+      0: Hold, 1: Kısa vadeli Long aç, 2: Kısa vadeli Short aç, 3: Kısa vadeli pozisyonu kapat
+    """
+    def __init__(self, symbol: str, client: Client, price_predictor: Optional[PricePredictor] = None,
+                 short_window: int = CONFIG["short_window"], long_window: int = CONFIG["long_window"],
+                 stop_loss: float = CONFIG["stop_loss"], take_profit: float = CONFIG["take_profit"],
+                 base_risk_percentage: float = CONFIG["base_risk_percentage"]):
+        self.symbol = symbol
+        self.client = client
+        self.price_predictor = price_predictor
+        self.short_window = short_window
+        self.long_window = long_window
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.base_risk_percentage = base_risk_percentage
+        self.executor = ThreadPoolExecutor(max_workers=4)
+
+        # Portföy bilgileri
+        self.initial_funds = 0.0
+        self.long_term_funds = 0.0
+        self.short_term_funds = 0.0
+
+        # Pozisyon bilgileri
+        self.short_term_position = 0  # 0: yok, 1: long, -1: short
+        self.long_term_position = 0
+        self.short_term_entry_price = 0.0
+        self.long_term_entry_price = 0.0
+
+        # İşlem geçmişi
+        self.trade_history: List[Dict[str, Any]] = []
+
+        # Fiyat geçmişi
+        self.prices = deque(maxlen=long_window)
+
+        # Sembol bilgileri
+        try:
+            symbol_info = self.client.get_symbol_info(self.symbol)
+            filters = symbol_info.get('filters', [])
+            lot_size_filter = next(filter(lambda f: f['filterType'] == 'LOT_SIZE', filters), None)
+            min_notional_filter = next(filter(lambda f: f['filterType'] == 'MIN_NOTIONAL', filters), None)
+            self.step_size = float(lot_size_filter['stepSize']) if lot_size_filter else 1.0
+            self.min_notional = float(min_notional_filter['minNotional']) if min_notional_filter else 10.0
+            logging.info(f"{self.symbol} için step_size: {self.step_size}, min_notional: {self.min_notional}")
+        except Exception as e:
+            logging.error(f"Sembol bilgileri alınırken hata: {e}")
+            self.step_size = 1.0
+            self.min_notional = 10.0
+
+    def reset(self) -> np.ndarray:
+        self.initial_funds = get_free_balance(self.client, "USDT")
+        if self.initial_funds <= 0.0:
+            logging.error(f"Hesap bakiyesi {self.initial_funds:.2f} USDT; işlem yapılamıyor.")
+            return np.zeros(15 if self.price_predictor else 14)
+        self.long_term_funds = self.initial_funds * CONFIG["portfolio_ratio"]
+        self.short_term_funds = self.initial_funds * CONFIG["portfolio_ratio"]
+        self.short_term_position = 0
+        self.long_term_position = 0
+        self.short_term_entry_price = 0.0
+        self.long_term_entry_price = 0.0
+        self.prices.clear()
+        self.trade_history.clear()
+        logging.debug(f"{self.symbol} için TradingEnv resetlendi.")
+        return self.get_state()
+
+    def update_price(self) -> float:
+        for attempt in range(3):
+            try:
+                avg = self.client.get_avg_price(symbol=self.symbol)
+                price = float(avg['price'])
+                logging.debug(f"{self.symbol} update_price deneme {attempt + 1}: {price}")
+                return price
+            except Exception as e:
+                logging.error(f"{self.symbol} fiyat alınırken hata (deneme {attempt + 1}/3): {e}")
+                time.sleep(0.3)
+        fallback_price = self.prices[-1] if self.prices else 0.0
+        logging.warning(f"{self.symbol} update_price fallback: {fallback_price}")
+        return fallback_price
+
+    def update(self) -> np.ndarray:
+        try:
+            current_price = self.executor.submit(self.update_price).result(timeout=5)
+            self.prices.append(current_price)
+            logging.debug(f"{self.symbol} Güncel fiyat: {current_price}")
+            return self.get_state()
+        except TimeoutError as te:
+            logging.error(f"{self.symbol} Fiyat güncelleme zaman aşımına uğradı: {te}")
+            return self.get_state()
+        except Exception as e:
+            logging.error(f"{self.symbol} update() sırasında hata: {e}")
+            return self.get_state()
+
+    def _close_short_term_position(self, current_price: float) -> float:
+        profit = 0.0
+        if self.short_term_position == 1:
+            profit = current_price - self.short_term_entry_price
+        elif self.short_term_position == -1:
+            profit = self.short_term_entry_price - current_price
+        commission = current_price * CONFIG["commission_rate"]
+        profit -= commission
+        self.short_term_funds += profit
+        logging.info(f"{self.symbol} Kısa vadeli pozisyon kapatıldı, kar (komisyon düştükten sonra): {profit:.4f}")
+        self.trade_history.append({
+            'type': 'short',
+            'entry': self.short_term_entry_price,
+            'exit': current_price,
+            'profit': profit,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+        })
+        self.short_term_position = 0
+        self.short_term_entry_price = 0.0
+        return profit
+
+    def get_state(self) -> np.ndarray:
+        try:
+            arr = np.array(self.prices)
+            if len(arr) < self.long_window:
+                arr = np.concatenate((np.zeros(self.long_window - len(arr)), arr))
+            short_sma = np.mean(arr[-self.short_window:])
+            long_sma = np.mean(arr[-self.long_window:])
+            rsi = talib.RSI(arr, timeperiod=14)[-1] if len(arr) >= 14 else 50.0
+            macd, macdsignal, _ = talib.MACD(arr, fastperiod=12, slowperiod=26, signalperiod=9)
+            macd_val = macd[-1] if len(macd) > 0 else 0.0
+            macdsignal_val = macdsignal[-1] if len(macdsignal) > 0 else 0.0
+            adx = talib.ADX(arr, arr, arr, timeperiod=14)[-1] if len(arr) >= 14 else 25.0
+            volatility = np.std(arr)
+            _, middle, _ = talib.BBANDS(arr, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+            middle_band = middle[-1] if len(middle) > 0 else 0.0
+            obv = talib.OBV(arr, np.ones_like(arr))
+            stochrsi, _ = talib.STOCHRSI(arr, timeperiod=14, fastk_period=3, fastd_period=3)
+            obv_change = (obv[-1] - obv[-self.short_window]) / (obv[-self.short_window] + 1e-6)
+            stochrsi_val = stochrsi[-1] if len(stochrsi) > 0 else 0.0
+
+            state = np.array([
+                arr[-1],
+                short_sma,
+                long_sma,
+                rsi,
+                macd_val,
+                macdsignal_val,
+                adx,
+                volatility,
+                obv_change,
+                stochrsi_val,
+                self.short_term_position,
+                self.long_term_position,
+                self.short_term_funds,
+                self.long_term_funds
+            ])
+
+            if self.price_predictor:
+                predictor_window = self.price_predictor.window_size
+                if len(arr) >= predictor_window:
+                    predicted_price = self.price_predictor.predict(arr[-predictor_window:])
+                else:
+                    predicted_price = 0.0
+                state = np.append(state, predicted_price)
+            else:
+                state = np.append(state, 0.0)
+
+            logging.debug(f"{self.symbol} get_state: {state}")
+            return state
+        except Exception as e:
+            logging.error(f"{self.symbol} get_state sırasında hata: {e}")
+            default_size = 15 if self.price_predictor is not None else 14
+            return np.zeros(default_size)
+
+    def process_action(self, action: int) -> float:
+        current_price = self.get_state()[0]
+        reward = 0.0
+        try:
+            if action == 1:
+                if self.short_term_funds <= 0:
+                    logging.error(f"{self.symbol} Kısa vadeli alım için yeterli fon yok.")
+                    return 0.0
+                self.short_term_position = 1
+                self.short_term_entry_price = current_price
+                used = self.short_term_funds * 0.5
+                self.short_term_funds -= used
+                logging.info(f"{self.symbol} Kısa vadeli Long açıldı: Fiyat {current_price:.4f}, Kullanılan: {used:.4f}")
+            elif action == 2:
+                if self.short_term_funds <= 0:
+                    logging.error(f"{self.symbol} Kısa vadeli Short için yeterli fon yok.")
+                    return 0.0
+                self.short_term_position = -1
+                self.short_term_entry_price = current_price
+                used = self.short_term_funds * 0.5
+                self.short_term_funds -= used
+                logging.info(f"{self.symbol} Kısa vadeli Short açıldı: Fiyat {current_price:.4f}, Kullanılan: {used:.4f}")
+            elif action == 3:
+                if self.short_term_position != 0:
+                    reward = self._close_short_term_position(current_price)
+                else:
+                    logging.debug(f"{self.symbol} Kısa vadeli kapatma: Açık pozisyon yok.")
+        except Exception as e:
+            logging.error(f"{self.symbol} process_action() sırasında hata: {e}")
+        return reward
+
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool]:
+        reward = self.process_action(action)
+        return self.get_state(), reward, False
+
+    def analyze_trades(self) -> Dict[str, Any]:
+        try:
+            total_trades = len(self.trade_history)
+            winning_trades = [trade for trade in self.trade_history if trade['profit'] > 0]
+            success_rate = (len(winning_trades) / total_trades) * 100 if total_trades > 0 else 0.0
+            return {
+                'short_term_funds': self.short_term_funds,
+                'long_term_funds': self.long_term_funds,
+                'total_trades': total_trades,
+                'success_rate': success_rate
+            }
+        except Exception as e:
+            logging.error(f"{self.symbol} Trade analizi sırasında hata: {e}")
+            return {}
+
+    def save_transactions(self, filename: str):
+        try:
+            if not self.trade_history:
+                logging.warning(f"{self.symbol} Trade history boş, kaydedilecek veri yok.")
+                return
+            with open(filename, mode='w', newline='') as file:
+                writer = csv.DictWriter(file, fieldnames=["type", "entry", "exit", "profit", "timestamp"])
+                writer.writeheader()
+                for trade in self.trade_history:
+                    writer.writerow(trade)
+            logging.info(f"{self.symbol} İşlemler {filename} dosyasına kaydedildi.")
+        except Exception as e:
+            logging.error(f"{self.symbol} Trade history dosyasına kaydedilirken hata: {e}")
+
+    def shutdown(self):
+        try:
+            self.executor.shutdown(wait=True)
+            logging.info(f"{self.symbol} Executor kapatıldı.")
+        except Exception as e:
+            logging.error(f"{self.symbol} Executor kapatılırken hata: {e}")
+
+#####################################
+# O3 Controller (Risk Yönetimi & Ayarlamalar)
+#####################################
+class O3Controller:
+    def __init__(self, env: TradingEnv, agent, max_daily_loss: float = CONFIG["max_daily_loss"],
+                 max_drawdown: float = CONFIG["max_drawdown"]):
+        self.env = env
+        self.agent = agent
+        self.max_daily_loss = max_daily_loss
+        self.max_drawdown = max_drawdown
+        self.daily_profit = 0.0
+        self.peak_equity = 0.0
+
+    def update_equity(self, current_equity: float) -> float:
+        if current_equity > self.peak_equity:
+            self.peak_equity = current_equity
+        drawdown = (self.peak_equity - current_equity) / self.peak_equity if self.peak_equity > 0 else 0.0
+        logging.debug(f"{self.env.symbol} Equity güncellendi: current_equity={current_equity}, peak_equity={self.peak_equity}, drawdown={drawdown:.2%}")
+        return drawdown
+
+    def check_risk(self) -> bool:
+        current_equity = get_free_balance(self.env.client, "USDT")
+        drawdown = self.update_equity(current_equity)
+        if self.daily_profit < -self.max_daily_loss:
+            logging.warning(f"{self.env.symbol} Günlük zarar limiti aşıldı: {self.daily_profit:.2f} USDT. Tüm pozisyonlar kapatılıyor.")
+            if self.env.short_term_position != 0:
+                self.env.process_action(3)
+            return False
+        if drawdown > self.max_drawdown:
+            logging.warning(f"{self.env.symbol} Maksimum çekilme limiti aşıldı: {drawdown:.2%}. Tüm pozisyonlar kapatılıyor.")
+            if self.env.short_term_position != 0:
+                self.env.process_action(3)
+            return False
+        return True
+
+    def consult_chatgpt(self, market_info: str) -> str:
+        prompt = f"Piyasa verileri: {market_info}. Bu durumda hangi adımları atmamız gerektiğini önerirsin?"
+        return chatgpt_response(prompt)
+
+    def adjust_parameters(self):
+        state = self.env.get_state()
+        volatility = state[7]
+        adx = state[6]
+        market_score = (adx / 50) + (volatility / 100)
+        logging.debug(f"{self.env.symbol} Piyasa skoru hesaplandı: {market_score:.2f}")
+        if market_score > 1.5:
+            old_loss = self.max_daily_loss
+            self.max_daily_loss = max(10.0, self.max_daily_loss * 0.8)
+            logging.info(f"{self.env.symbol} Piyasa skoru yüksek ({market_score:.2f}). max_daily_loss {old_loss} -> {self.max_daily_loss}")
+            old_epsilon = self.agent.epsilon
+            self.agent.epsilon = min(1.0, self.agent.epsilon * 1.1)
+            logging.info(f"{self.env.symbol} Ajan epsilon {old_epsilon:.2f} -> {self.agent.epsilon:.2f}")
+
+    def control_loop(self) -> bool:
+        risk_ok = self.check_risk()
+        if not risk_ok:
+            current_equity = get_free_balance(self.env.client, "USDT")
+            market_info = f"Günlük zarar: {self.daily_profit:.2f} USDT, Çekilme: {self.update_equity(current_equity):.2%}"
+            suggestion = self.consult_chatgpt(market_info)
+            logging.info(f"{self.env.symbol} ChatGPT önerisi: {suggestion}")
+            self.agent.epsilon = min(1.0, self.agent.epsilon * 1.2)
+        else:
+            self.adjust_parameters()
+        return risk_ok
+
+#####################################
+# DQN Agent (Trading AI)
+#####################################
+class DQNAgent:
+    def __init__(self, state_size: int, action_size: int, symbol: str):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.symbol = symbol
+        self.memory = deque(maxlen=CONFIG["dqn"]["memory_size"])
+        self.gamma = CONFIG["dqn"]["gamma"]
+        self.epsilon = CONFIG["dqn"]["epsilon"]
+        self.epsilon_min = CONFIG["dqn"]["epsilon_min"]
+        self.epsilon_decay = CONFIG["dqn"]["epsilon_decay"]
+        self.learning_rate = CONFIG["dqn"]["learning_rate"]
+        self.tau = CONFIG["dqn"]["tau"]
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()
+
+    def _build_model(self) -> Sequential:
+        try:
+            model = Sequential([
+                Input(shape=(self.state_size,)),
+                Dense(256, activation='relu'),
+                BatchNormalization(),
+                Dropout(0.2),
+                Dense(256, activation='relu'),
+                BatchNormalization(),
+                Dropout(0.2),
+                Dense(128, activation='relu'),
+                Dense(self.action_size, activation='linear')
+            ])
+            model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
+            logging.debug(f"{self.symbol} DQN modeli oluşturuldu.")
+            return model
+        except Exception as e:
+            logging.error(f"{self.symbol} DQN modeli oluşturulurken hata: {e}")
+            raise
+
+    def update_target_model(self):
+        try:
+            weights = self.model.get_weights()
+            target_weights = self.target_model.get_weights()
+            for i in range(len(target_weights)):
+                target_weights[i] = self.tau * weights[i] + (1 - self.tau) * target_weights[i]
+            self.target_model.set_weights(target_weights)
+            logging.debug(f"{self.symbol} Target model güncellendi.")
+        except Exception as e:
+            logging.error(f"{self.symbol} Target model güncellenirken hata: {e}")
+
+    def remember(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool):
+        self.memory.append((state, action, reward, next_state, done))
+        logging.debug(f"{self.symbol} Hafızaya ekleme yapıldı.")
+
+    def act(self, state: np.ndarray) -> int:
+        try:
+            if np.random.rand() <= self.epsilon:
+                action = random.randrange(self.action_size)
+                logging.debug(f"{self.symbol} Random action seçildi: {action}")
+                return action
+            act_values = self.model.predict(state.reshape(1, -1), verbose=0)
+            action = int(np.argmax(act_values[0]))
+            logging.debug(f"{self.symbol} Predict action: {action}")
+            return action
+        except Exception as e:
+            logging.error(f"{self.symbol} act() sırasında hata: {e}")
+            return random.randrange(self.action_size)
+
+    def replay(self, batch_size: int):
+        try:
+            if len(self.memory) < batch_size:
+                return
+            minibatch = random.sample(self.memory, batch_size)
+            for state, action, reward, next_state, done in minibatch:
+                target = self.model.predict(state.reshape(1, -1), verbose=0)
+                if done:
+                    target[0][action] = reward
+                else:
+                    t = self.target_model.predict(next_state.reshape(1, -1), verbose=0)
+                    target[0][action] = reward + self.gamma * np.amax(t[0])
+                self.model.fit(state.reshape(1, -1), target, epochs=1, verbose=0)
+            if self.epsilon > self.epsilon_min:
+                self.epsilon *= self.epsilon_decay
+            logging.debug(f"{self.symbol} Replay işlemi tamamlandı.")
+        except Exception as e:
+            logging.error(f"{self.symbol} replay() sırasında hata: {e}")
+
+    def save(self, name: str):
+        try:
+            self.model.save(name)
+            logging.info(f"{self.symbol} DQN model kaydedildi.")
+        except Exception as e:
+            logging.error(f"{self.symbol} Model kaydedilirken hata: {e}")
+
+    def load(self, name: str):
+        try:
+            self.model = tf.keras.models.load_model(name)
+            self.update_target_model()
+            logging.info(f"{self.symbol} DQN model yüklendi.")
+        except Exception as e:
+            logging.error(f"{self.symbol} Model yüklenirken hata: {e}")
+
+#####################################
+# Backtesting Fonksiyonu
+#####################################
+def backtest_strategy(env: TradingEnv, strategy_func, historical_data: List[float]) -> Dict[str, Any]:
+    rewards = []
+    env.prices.clear()
+    env.trade_history.clear()
+    for price in historical_data:
+        env.prices.append(price)
+        state = env.get_state()
+        action = strategy_func(state)
+        next_state, reward, _ = env.step(action)
+        rewards.append(reward)
+    total_reward = sum(rewards)
+    performance = {
+        "total_reward": total_reward,
+        "average_reward": np.mean(rewards),
+        "num_trades": len(env.trade_history),
+        "trade_history": env.trade_history
+    }
+    return performance
+
+#####################################
+# Fonksiyon: Belirli bir sembol için ticaret döngüsünü çalıştırır
+#####################################
+def run_trading_for_symbol(symbol: str, client: Client):
+    logging.info(f"{symbol} için ticaret döngüsü başlatılıyor.")
+    price_predictor = PricePredictor(window_size=CONFIG["price_predictor_window"])
+    env = TradingEnv(
+        symbol,
+        client,
+        price_predictor=price_predictor,
+        short_window=CONFIG["short_window"],
+        long_window=CONFIG["long_window"],
+        stop_loss=CONFIG["stop_loss"],
+        take_profit=CONFIG["take_profit"],
+        base_risk_percentage=CONFIG["base_risk_percentage"]
+    )
+
+    # Durum boyutu: price_predictor varsa 15, aksi halde 14 öğe
+    state_size = 15 if price_predictor is not None else 14
+    action_size = 4  # 0: Hold, 1: Kısa Long, 2: Kısa Short, 3: Kısa Kapat
+    agent = DQNAgent(state_size, action_size, symbol)
+    batch_size = 32
+    predictor_training_data = []
+    o3_controller = O3Controller(env, agent, max_daily_loss=CONFIG["max_daily_loss"],
+                                 max_drawdown=CONFIG["max_drawdown"])
+
+    EPISODES = CONFIG["num_episodes"]
+    STEPS_PER_EPISODE = CONFIG["episode_steps"]
+    iteration = 0
+    episode = 1
+
+    try:
+        while episode <= EPISODES:
+            start_time = time.time()
+            logging.info(f"{symbol} - Episode {episode} başladı.")
+            state = env.reset()
+            episode_reward = 0.0
+
+            for t in range(STEPS_PER_EPISODE):
+                state = env.update()
+
+                # Risk kontrolü
+                if not o3_controller.control_loop():
+                    logging.warning(f"{symbol} - O3 Controller ticareti askıya aldı. 10 saniye bekleniyor...")
+                    time.sleep(10)
+                    continue
+
+                # Online eğitim verisi toplama
+                if len(env.prices) >= price_predictor.window_size + 1:
+                    prices_array = np.array(env.prices)
+                    X_seq = prices_array[-price_predictor.window_size - 1:-1]
+                    y_val = prices_array[-1]
+                    predictor_training_data.append((X_seq, y_val))
+
+                action = agent.act(state)
+                next_state, reward, _ = env.step(action)
+                episode_reward += reward
+                o3_controller.daily_profit += reward
+
+                agent.remember(state, action, reward, next_state, False)
+                state = next_state
+
+                if len(agent.memory) > batch_size:
+                    agent.replay(batch_size)
+
+                if iteration % 10 == 0:
+                    agent.update_target_model()
+
+                if iteration % CONFIG["report_interval"] == 0 and iteration > 0:
+                    model_filename = f"dqn_model_{symbol}.h5"
+                    agent.save(model_filename)
+                    report_prompt = (
+                        f"{symbol} - Episode {episode} tamamlandı. Toplam ödül {episode_reward:.4f}, "
+                        f"portföy durumu: {env.analyze_trades()}. "
+                        f"Piyasa durumu: Fiyat {state[0]:.4f}, RSI {state[3]:.2f}, ADX {state[6]:.2f}."
+                    )
+                    chatgpt_report = chatgpt_response(report_prompt)
+                    logging.info(f"{symbol} - ChatGPT raporu: {chatgpt_report}")
+
+                iteration += 1
+
+                if iteration % 100 == 0 and len(predictor_training_data) >= 10:
+                    X_train = np.array([x for x, _ in predictor_training_data])
+                    y_train = np.array([y for _, y in predictor_training_data])
+                    X_train = X_train.reshape(X_train.shape[0], price_predictor.window_size, 1)
+                    y_train = y_train.reshape(y_train.shape[0], 1)
+                    logging.info(f"{symbol} - PricePredictor online eğitimi başlıyor...")
+                    env.executor.submit(price_predictor.train, X_train, y_train, 1, 1)
+                    predictor_training_data = []
+
+                time.sleep(CONFIG["sleep_interval"])
+
+            transaction_filename = f"transactions_{symbol}_episode_{episode}.csv"
+            env.save_transactions(transaction_filename)
+            trade_analysis = env.analyze_trades()
+            duration = time.time() - start_time
+            logging.info(
+                f"{symbol} - Episode {episode} tamamlandı. Adım: {STEPS_PER_EPISODE}, Ödül: {episode_reward:.4f}, Süre: {duration:.2f} sn")
+            logging.info(f"{symbol} - İşlem Analizi: {trade_analysis}")
+            episode += 1
+
+    except KeyboardInterrupt:
+        logging.info(f"{symbol} için ticaret döngüsü kullanıcı tarafından kesildi. Sonlandırılıyor...")
+    except Exception as e:
+        logging.error(f"{symbol} ana döngü sırasında beklenmeyen hata: {e}")
+    finally:
+        env.shutdown()
+
+#####################################
+# Ana Program Bölümü (Main Loop)
+#####################################
+if __name__ == "__main__":
+    # API anahtarlarınızı güvenli bir şekilde yönetin (örn: ortam değişkenlerinden okuyun)
+    api_key = ""
+    api_secret = ""
+
+    try:
+        client = Client(api_key, api_secret)
+        account = client.get_account()
+        logging.info("API Bağlantısı başarılı. Hesap bilgisi alındı.")
+    except Exception as e:
+        logging.error(f"API bağlantısı sırasında hata: {e}")
+        exit()
+
+    # İşlem yapılacak coin çiftlerini tanımlayın (örn: toplam 21 coin: BTCUSDT + 20 ek coin)
+    coin_list = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT",
+        "SOLUSDT", "DOTUSDT", "DOGEUSDT", "LTCUSDT", "AVAXUSDT",
+        "UNIUSDT", "LINKUSDT", "XLMUSDT", "ALGOUSDT", "VETUSDT",
+        "ICPUSDT", "TRXUSDT", "MATICUSDT", "ETCUSDT", "FILUSDT",
+        "EOSUSDT"
+    ]
+
+    # Her coin için ticaret döngülerini paralel olarak başlatın
+    with ThreadPoolExecutor(max_workers=len(coin_list)) as executor:
+        futures = {executor.submit(run_trading_for_symbol, symbol, client): symbol for symbol in coin_list}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                logging.error(f"{symbol} için ticaret döngüsü çalışırken hata oluştu: {exc}")
